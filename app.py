@@ -95,7 +95,12 @@ def execute_db_query_with_timeout(query: str, timeout_seconds: float = 1.5):
 # =========================================================
 # GET DATA FROM DATABRICKS
 # =========================================================
-
+@app.get("/testingapi")
+def home():
+    return {
+        "status": "success",
+        "message": "FastAPI is running on Azure"
+    }
 @app.get("/data")
 def get_data():
 
