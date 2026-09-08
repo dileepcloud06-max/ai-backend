@@ -99,7 +99,7 @@ def execute_db_query_with_timeout(query: str, timeout_seconds: float = 1.5):
 def home():
     return {
         "status": "success",
-        "message": "FastAPI is running on Azure"
+        "message": "FastAPI is  on Azure"
     }
     
     
