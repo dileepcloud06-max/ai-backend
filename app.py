@@ -101,6 +101,8 @@ def home():
         "status": "success",
         "message": "FastAPI is running on Azure"
     }
+    
+    
 @app.get("/data")
 def get_data():
 
