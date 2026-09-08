@@ -36,7 +36,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:4200",
-        "http://127.0.0.1:4200"
+        "http://127.0.0.1:4200",
+        "https://ai-frontend-pi-six.vercel.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
