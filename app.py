@@ -105,7 +105,7 @@ def get_data():
         cursor = connection.cursor()
 
         query = """
-           SELECT * FROM gl_review_intelligence where email_status !='Y' and rating <= 3 order by review_id limit 10
+           SELECT * FROM gl_review_intelligence order by review_id limit 10
         """
 
         cursor.execute(query)
