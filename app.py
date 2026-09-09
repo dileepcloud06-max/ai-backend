@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from typing import Optional
 from datetime import date, datetime, timezone
 from typing import Any
@@ -8,22 +8,21 @@ import json
 import re
 import uuid
 import smtplib
+import threading
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
 import base64
 import csv
+from pathlib import Path
 from urllib.parse import quote_plus
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-from databricks import sql
-from databricks.sdk.core import Config, oauth_service_principal
 from google import genai
 from google.genai import types
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-
-load_dotenv()
+import mysql.connector
 
 app = FastAPI()
 
@@ -37,7 +36,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:4200",
         "http://127.0.0.1:4200",
-        "https://ai-frontend-pi-six.vercel.app"
+		"https://ai-frontend-pi-six.vercel.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -45,25 +44,29 @@ app.add_middleware(
 )
 
 
-# =========================================================
-# DATABRICKS OAUTH CONNECTION
-# =========================================================
+env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=env_path, override=True)
+
 
 def get_connection():
+    host = os.getenv("DB_HOST")
+    port = int(os.getenv("DB_PORT", "4000"))
 
-    config = Config(
-        host=f"https://{os.getenv('DATABRICKS_SERVER_HOSTNAME')}",
-        client_id=os.getenv("DATABRICKS_CLIENT_ID"),
-        client_secret=os.getenv("DATABRICKS_CLIENT_SECRET")
+    if not host:
+        raise RuntimeError("DB_HOST is missing in .env")
+
+    print(f"Connecting to MySQL: {host}:{port}")
+
+    return mysql.connector.connect(
+        host=host,
+        port=port,
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_NAME"),
+        ssl_disabled=False,
+        autocommit=True,
+        connection_timeout=30
     )
-
-    return sql.connect(
-        server_hostname=os.getenv("DATABRICKS_SERVER_HOSTNAME"),
-        http_path=os.getenv("DATABRICKS_HTTP_PATH"),
-        credentials_provider=lambda: oauth_service_principal(config)
-    )
-
-import threading
 
 def execute_db_query_with_timeout(query: str, timeout_seconds: float = 1.5):
     res_holder = []
@@ -94,15 +97,9 @@ def execute_db_query_with_timeout(query: str, timeout_seconds: float = 1.5):
 
 
 # =========================================================
-# GET DATA FROM DATABRICKS
+# GET DATA FROM MYSQL
 # =========================================================
-@app.get("/testingapi")
-def home():
-    return {
-        "status": "success",
-        "message": "FastAPI is  on Azure"
-    }
-    
+
 @app.get("/data")
 def get_data():
 
@@ -115,7 +112,7 @@ def get_data():
         cursor = connection.cursor()
 
         query = """
-           SELECT * FROM backspace_databricks.gold.gl_review_intelligence where email_status !='Y' and rating <= 3 order by review_id limit 10
+           SELECT * FROM gl_review_intelligence where email_status != 'Y' and rating <= 3 order by review_id limit 10
         """
 
         cursor.execute(query)
@@ -142,7 +139,7 @@ def get_data():
 
         raise HTTPException(
             status_code=500,
-            detail=f"Databricks error: {str(e)}"
+            detail=f"MySQL error: {str(e)}"
         )
 
     finally:
@@ -404,8 +401,8 @@ def get_product_reviews(product: str):
             SELECT review_id, reviewer_name, review_text, rating, source, review_date,
                    sentiment, issue_type, severity, problem_summary,
                    recommended_solution, img_url
-            FROM backspace_databricks.gold.gl_review_intelligence
-            WHERE lower(product) = lower(?)
+            FROM gl_review_intelligence
+            WHERE lower(product) = lower(%s)
             ORDER BY review_date DESC, processed_timestamp DESC
             LIMIT 50
         """, (product,))
@@ -442,7 +439,7 @@ def get_alert_count():
     try:
         rows = fetch_rows("""
             SELECT COUNT(*) AS alert_count
-            FROM backspace_databricks.gold.gl_review_intelligence
+            FROM gl_review_intelligence
             WHERE escalation = 'Y' AND ins_status = 'Y'
         """)
         return {"status": "success", "count": int(rows[0]["alert_count"] or 0)}
@@ -459,7 +456,7 @@ def get_crm_summary():
                 COUNT(CASE WHEN email_status = 'Y' AND ins_status = 'I' THEN 1 END) AS investigation_count,
                 COUNT(CASE WHEN escalation = 'Y' THEN 1 END) AS escalation_count,
                 COUNT(CASE WHEN email_status = 'Y' AND ins_status = 'C' THEN 1 END) AS closed_count
-            FROM backspace_databricks.gold.gl_review_intelligence
+            FROM gl_review_intelligence
         """)
         return {"status": "success", "data": rows[0] if rows else {}}
     except Exception as error:
@@ -472,7 +469,7 @@ def get_crm_reviews():
         rows = fetch_rows("""
             SELECT review_id, reviewer_name, review_text, product, issue_type, rating,
                    source, review_date, email_status, ins_status, escalation
-            FROM backspace_databricks.gold.gl_review_intelligence
+            FROM gl_review_intelligence
             WHERE email_status = 'Y' AND ins_status = 'I'
             ORDER BY processed_timestamp DESC
             LIMIT 10
@@ -490,9 +487,9 @@ def close_crm_review(review_id: str):
         connection = get_connection()
         cursor = connection.cursor()
         cursor.execute("""
-            UPDATE backspace_databricks.gold.gl_review_intelligence
+            UPDATE gl_review_intelligence
             SET ins_status = 'C'
-            WHERE review_id = ? AND email_status = 'Y' AND ins_status = 'I'
+            WHERE review_id = %s AND email_status = 'Y' AND ins_status = 'I'
         """, (review_id,))
         return {"status": "success", "review_id": review_id, "ins_status": "C"}
     except Exception as error:
@@ -620,7 +617,7 @@ def send_escalation_email(recipient: str, product: str, review: str, problem: st
 
 
 # =========================================================
-# INSERT NEW REVIEW INTO DATABRICKS
+# INSERT NEW REVIEW INTO MYSQL
 # =========================================================
 @app.post("/newreview")
 def create_new_review(request: NewReview):
@@ -636,21 +633,22 @@ def create_new_review(request: NewReview):
     image_url = request.url or None
     connection = None
     cursor = None
-    saved_databricks = False
+    saved_mysql = False
 
     try:
         connection = get_connection()
         cursor = connection.cursor()
 
         query = """
-            INSERT INTO backspace_databricks.gold.gl_review_intelligence
+            INSERT INTO gl_review_intelligence
             (
                 review_id, reviewer_name, review_text, cleaned_review, rating, source, product,
                 review_date, sentiment, sentiment_confidence, issue_type, issue_confidence,
                 severity, problem_summary, recommended_solution, priority, best_model_prediction,
                 model_used, processed_timestamp, email_status, ins_status, img_url, state, escalation
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
 
         cursor.execute(
@@ -682,19 +680,19 @@ def create_new_review(request: NewReview):
                 escalation
             )
         )
-        saved_databricks = True
+        saved_mysql = True
     except Exception as db_err:
-        print(f"Databricks connection/insert note: {db_err}")
+        print(f"MySQL connection/insert note: {db_err}")
     finally:
         if cursor:
             cursor.close()
         if connection:
             connection.close()
 
-    if not saved_databricks:
+    if not saved_mysql:
         raise HTTPException(
             status_code=500,
-            detail="Review analysis completed, but the Databricks gold insert failed. Check backend logs for the database error."
+            detail="Review analysis completed, but the MySQL insert failed. Check backend logs for the database error."
         )
 
     email_status = "N"
@@ -724,7 +722,7 @@ def create_new_review(request: NewReview):
         "ins_status": "I",
         "state": "A"
     }
-    if escalation == "Y" and saved_databricks:
+    if escalation == "Y" and saved_mysql:
         recipient = os.getenv("ESCALATION_EMAIL") or os.getenv("EMAIL_ADDRESS")
         if recipient:
             try:
@@ -742,7 +740,7 @@ def create_new_review(request: NewReview):
                     update_connection = get_connection()
                     update_cursor = update_connection.cursor()
                     update_cursor.execute(
-                        "UPDATE backspace_databricks.gold.gl_review_intelligence SET email_status = ? WHERE review_id = ?",
+                        "UPDATE gl_review_intelligence SET email_status = %s WHERE review_id = %s",
                         (email_status, review_id)
                     )
                 finally:
@@ -776,7 +774,7 @@ def create_new_review(request: NewReview):
         "message": "New review submitted successfully",
         "data": {
             **new_entry,
-            "databricksSaved": saved_databricks,
+            "mysqlSaved": saved_mysql,
             "emailTriggered": email_status == "Y"
         }
     }
@@ -788,7 +786,7 @@ def create_new_review(request: NewReview):
 
 class EmailRequest(BaseModel):
 
-    email: str
+    email: EmailStr
     payload: str
     solution: str
     review_id: str
@@ -862,7 +860,7 @@ Customer Support Team
             connection = get_connection()
             cursor = connection.cursor()
             cursor.execute(
-                "UPDATE backspace_databricks.gold.gl_review_intelligence SET email_status = ? WHERE review_id = ?",
+                "UPDATE gl_review_intelligence SET email_status = %s WHERE review_id = %s",
                 ("Y", request.review_id)
             )
         finally:
@@ -915,7 +913,7 @@ def get_sentiment_summary():
 
         query = """
             SELECT *
-            FROM backspace_databricks.gold.gl_sentiment_summary
+            FROM gl_sentiment_summary
         """
         cursor.execute(query)
         columns = [
@@ -937,7 +935,7 @@ def get_sentiment_summary():
 
         raise HTTPException(
             status_code=500,
-            detail=f"Databricks sentiment summary error: {str(e)}"
+            detail=f"MySQL sentiment summary error: {str(e)}"
         )
 
     finally:
@@ -962,7 +960,7 @@ def gl_issue_summary():
 
         query = """
             SELECT *
-            FROM backspace_databricks.gold.gl_issue_summary
+            FROM gl_issue_summary
         """
         cursor.execute(query)
         columns = [
@@ -984,7 +982,7 @@ def gl_issue_summary():
 
         raise HTTPException(
             status_code=500,
-            detail=f"Databricks sentiment summary error: {str(e)}"
+            detail=f"MySQL issue summary error: {str(e)}"
         )
 
     finally:
@@ -1009,7 +1007,7 @@ def gl_model_metrics():
 
         query = """
             SELECT *
-            FROM backspace_databricks.gold.gl_model_metrics
+            FROM gl_model_metrics
         """
         cursor.execute(query)
         columns = [
@@ -1031,7 +1029,7 @@ def gl_model_metrics():
 
         raise HTTPException(
             status_code=500,
-            detail=f"Databricks sentiment summary error: {str(e)}"
+            detail=f"MySQL model metrics error: {str(e)}"
         )
 
     finally:
@@ -1057,7 +1055,7 @@ def gl_product_insights():
 
         query = """
             SELECT *
-            FROM backspace_databricks.gold.gl_product_insights
+            FROM gl_product_insights
         """
         cursor.execute(query)
         columns = [
@@ -1079,7 +1077,7 @@ def gl_product_insights():
 
         raise HTTPException(
             status_code=500,
-            detail=f"Databricks sentiment summary error: {str(e)}"
+            detail=f"MySQL product insights error: {str(e)}"
         )
 
     finally:
@@ -1089,156 +1087,66 @@ def gl_product_insights():
 
         if connection:
             connection.close()
+def fetch_table(cursor, table_name):
 
-
-# =========================================================
-# UNIFIED ANALYTICS DASHBOARD API ENDPOINT
-# =========================================================
-@app.get("/analytics-overview")
-def get_analytics_overview():
-    review_rows = execute_db_query_with_timeout(
-        """
+    cursor.execute(f"""
         SELECT *
-        FROM backspace_databricks.gold.gl_review_intelligence
-        """,
-        timeout_seconds=30.0
-    )
+        FROM `{table_name}`
+    """)
 
-    counts = {"Positive": 0, "Neutral": 0, "Negative": 0}
-    source_counts = {}
-    confusion_matrix = {actual: {predicted: 0 for predicted in counts} for actual in counts}
-    for row in review_rows:
-        sentiment = str(row.get("sentiment") or "").strip().title()
-        if sentiment in counts:
-            counts[sentiment] += 1
-        source = str(row.get("source") or "Unknown").strip() or "Unknown"
-        source_counts[source] = source_counts.get(source, 0) + 1
-        predicted = str(row.get("best_model_prediction") or "").strip().title()
-        if sentiment in confusion_matrix and predicted in confusion_matrix[sentiment]:
-            confusion_matrix[sentiment][predicted] += 1
+    columns = [desc[0] for desc in cursor.description]
+    rows = cursor.fetchall()
 
-    total_reviews = len(review_rows)
-    percentage_denominator = total_reviews or 1
-    formatted_sentiment_summary = [
-        {
-            "sentiment": s,
-            "review_count": counts[s],
-            "percentage": round((counts[s] / percentage_denominator) * 100, 2)
-        }
-        for s in ["Positive", "Neutral", "Negative"]
+    return [
+        dict(zip(columns, row))
+        for row in rows
     ]
 
-    model_rows = execute_db_query_with_timeout(
-        "SELECT * FROM backspace_databricks.gold.gl_model_metrics",
-        timeout_seconds=30.0
-    )
 
-    def model_field(row: dict, *names: str):
-        fields = {str(key).lower(): value for key, value in row.items()}
-        for name in names:
-            if fields.get(name.lower()) is not None:
-                return fields[name.lower()]
-        return None
+@app.get("/dashboard-summary")
+def get_dashboard_summary():
 
-    formatted_model_metrics = []
-    for row in model_rows:
-        def percentage(*names: str) -> float:
-            value = float(model_field(row, *names) or 0)
-            return round(value * 100, 2) if value <= 1 else round(value, 2)
+    connection = None
+    cursor = None
 
-        formatted_model_metrics.append({
-            "model": str(model_field(row, "model_name", "model") or "Unknown"),
-            "accuracy": percentage("accuracy"),
-            "precision": percentage("precision"),
-            "recall": percentage("recall"),
-            "f1": percentage("f1_score", "f1", "f1score"),
-            "training_time": model_field(row, "training_time", "trainingtime", "training_time_seconds")
-        })
+    try:
+        connection = get_connection()
+        cursor = connection.cursor()
 
-    all_y_records = [r for r in review_rows if str(r.get("email_status") or "").upper() == "Y"]
+        return {
+            "status": "success",
+            "data": {
+                "sentiment_summary": fetch_table(
+                    cursor,
+                    "gl_sentiment_summary"
+                ),
 
-    email_events = []
-    for email_record in all_y_records:
-        timestamp = email_record.get("email_sent_at") or email_record.get("processed_timestamp") or email_record.get("review_date")
-        if timestamp:
-            email_events.append({
-                "review_id": str(email_record.get("review_id") or ""),
-                "timestamp": str(timestamp),
-                "email_status": "Y"
-            })
-    email_events.sort(key=lambda event: event["timestamp"], reverse=True)
+                "issue_summary": fetch_table(
+                    cursor,
+                    "gl_issue_summary"
+                ),
 
-    now_dt = datetime.now(timezone.utc)
-    today_str = now_dt.strftime("%Y-%m-%d")
-
-    today_emails = []
-    days7_emails = []
-    days30_emails = []
-
-    for e in all_y_records:
-        ts_val = e.get("email_sent_at") or e.get("processed_timestamp") or e.get("review_date") or e.get("dateTime")
-        date_str = str(ts_val)[:10] if ts_val else today_str
-        if date_str == today_str:
-            today_emails.append(e)
-
-        try:
-            dt = datetime.fromisoformat(date_str)
-            if (now_dt.date() - dt.date()).days <= 7:
-                days7_emails.append(e)
-            if (now_dt.date() - dt.date()).days <= 30:
-                days30_emails.append(e)
-        except Exception:
-            days7_emails.append(e)
-            days30_emails.append(e)
-
-    total_sent = len(all_y_records)
-    today_count = len(today_emails)
-    days_7_count = len(days7_emails)
-    days_30_count = len(days30_emails)
-
-    hourly = [0] * 20
-    for e in all_y_records:
-        ts = str(e.get("processed_timestamp") or e.get("dateTime") or "")
-        hr = 12
-        if ":" in ts:
-            try:
-                parts = ts.split(" ")[-1] if " " in ts else ts.split("T")[-1]
-                hr = int(parts.split(":")[0])
-            except Exception:
-                pass
-        idx = min(19, int((hr / 24.0) * 20))
-        hourly[idx] += 1
-
-    max_h = max(hourly) if hourly else 0
-    bars = [int((h / max_h) * 85) if max_h > 0 and h > 0 else 0 for h in hourly]
-
-    email_analytics_data = {
-        "today_count": today_count,
-        "days_7_count": days_7_count,
-        "days_30_count": days_30_count,
-        "total_sent": total_sent,
-        "chart_bars": bars
-    }
-
-    return {
-        "status": "success",
-        "data": {
-            "total_reviews": total_reviews,
-            "sentiment_summary": formatted_sentiment_summary,
-            "source_summary": [{"source": source, "review_count": count} for source, count in source_counts.items()],
-            "confusion_matrix": [
-                [confusion_matrix[actual][predicted] for predicted in counts]
-                for actual in counts
-            ],
-            "model_metrics": formatted_model_metrics,
-            "email_analytics": email_analytics_data,
-            "email_events": email_events,
-            "model_predictions": [],
-            "model_analysis": []
+                "model_metrics": fetch_table(
+                    cursor,
+                    "gl_model_metrics"
+                ),
+            }
         }
-    }
 
+    except Exception as e:
 
+        raise HTTPException(
+            status_code=500,
+            detail=f"Dashboard summary error: {str(e)}"
+        )
+
+    finally:
+
+        if cursor:
+            cursor.close()
+
+        if connection:
+            connection.close()
 
 # =========================================================
 # CHATBOT API ENDPOINT (GOOGLE GEMINI AI INTEGRATION)
@@ -1350,143 +1258,6 @@ def get_catalog_product(product_name: str, catalog: list):
     }
 
 
-def get_catalog_recommendations(catalog: list, query: str = "", limit: int = 5):
-    """Return the strongest catalog products, prioritizing requested features."""
-    query_words = set(re.findall(r"[a-z0-9]+", (query or "").lower()))
-    query_text = (query or "").lower()
-    category_aliases = {
-        "phone": ("phone", "mobile", "smartphone"),
-        "laptop": ("laptop", "notebook"),
-        "air fryer": ("air fryer", "airfryer", "fryer"),
-        "refrigerator": ("refrigerator", "fridge"),
-        "furniture": ("furniture", "sofa", "chair", "table", "bed")
-    }
-    requested_category = next(
-        (category for category, aliases in category_aliases.items() if any(alias in query_text for alias in aliases)),
-        None
-    )
-    budget_match = re.search(r"(?:under|below|upto|up to|less than)\s*(?:rs\.?|inr\.?)?\s*(\d+(?:\.\d+)?)\s*(k|thousand|lakh)?", query_text)
-    budget = None
-    if budget_match:
-        budget = float(budget_match.group(1))
-        unit = (budget_match.group(2) or "").strip()
-        if unit in {"k", "thousand"}:
-            budget *= 1000
-        elif unit == "lakh":
-            budget *= 100000
-
-    filtered_catalog = []
-    for item in catalog:
-        item_category = str(item.get("category") or "").lower()
-        if requested_category and requested_category not in item_category:
-            continue
-        if budget is not None:
-            try:
-                if float(item.get("price_inr") or 0) > budget:
-                    continue
-            except (TypeError, ValueError):
-                continue
-        filtered_catalog.append(item)
-
-    if requested_category or budget is not None:
-        catalog = filtered_catalog
-
-    def score(item):
-        try:
-            base_score = float(item.get("recommendation_score") or 0)
-        except (TypeError, ValueError):
-            base_score = 0
-        best_for = str(item.get("best_for") or "").lower()
-        feature_score = sum(20 for word in query_words if word in best_for)
-        if "camera" in query_words:
-            try:
-                feature_score += float(item.get("camera_mp") or 0) / 10
-            except (TypeError, ValueError):
-                pass
-        return base_score + feature_score
-
-    recommended_items = [
-        item for item in catalog
-        if item.get("product_name") and str(item.get("buy_recommendation", "")).upper() != "DON'T BUY"
-    ]
-    # If every matching item is flagged, show the matching products with their warning
-    # instead of returning unrelated products from another category.
-    items_to_rank = recommended_items or [item for item in catalog if item.get("product_name")]
-    products = [
-        get_catalog_product(item.get("product_name", ""), catalog)
-        for item in sorted(items_to_rank, key=score, reverse=True)
-    ]
-    return [product for product in products if product][:limit]
-
-
-def get_catalog_dont_recommend(catalog: list, limit: int = 5):
-    """Return catalog products explicitly marked as unsafe purchase choices."""
-    def negative_score(item):
-        try:
-            return float(item.get("negative_pct") or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    products = [
-        get_catalog_product(item.get("product_name", ""), catalog)
-        for item in sorted(catalog, key=negative_score, reverse=True)
-        if str(item.get("buy_recommendation", "")).upper() == "DON'T BUY"
-    ]
-    return [product for product in products if product][:limit]
-
-
-def get_sentiment_counts():
-    """Read positive, negative, and neutral review totals from Databricks insights."""
-    rows = execute_db_query_with_timeout(
-        "SELECT * FROM backspace_databricks.gold.gl_product_insights",
-        timeout_seconds=30.0
-    )
-    counts = {"positive": 0, "negative": 0, "neutral": 0}
-    for row in rows:
-        fields = {str(key).lower(): value for key, value in row.items()}
-        sentiment = fields.get("sentiment") or fields.get("sentiment_label") or fields.get("review_sentiment")
-        if sentiment:
-            key = str(sentiment).strip().lower()
-            if key in counts:
-                counts[key] += 1
-            continue
-        for key in counts:
-            value = fields.get(key) or fields.get(f"{key}_reviews") or fields.get(f"{key}_count")
-            if value is not None:
-                try:
-                    counts[key] += int(value)
-                except (TypeError, ValueError):
-                    pass
-    return counts
-
-
-def is_sentiment_count_question(text: str):
-    query = (text or "").lower()
-    return any(word in query for word in ("positive", "negative", "neutral")) and any(
-        word in query for word in ("review", "reviews", "sentiment", "how many", "count")
-    )
-
-
-def is_dont_recommend_question(text: str):
-    query = (text or "").lower()
-    return any(phrase in query for phrase in (
-        "don't recommend", "do not recommend", "dont recommend", "bad products", "worst products", "avoid products"
-    ))
-
-
-def is_product_recommendation_question(text: str):
-    """Recognize broad recommendation requests and feature-only follow-ups."""
-    query = (text or "").lower()
-    recommendation_words = ("buy", "purchase", "worth it", "recommend", "suggest", "best", "top")
-    product_words = ("mobile", "phone", "smartphone", "product", "device")
-    feature_words = ("camera", "battery", "gaming", "performance", "display", "storage")
-    return (
-        any(phrase in query for phrase in recommendation_words)
-        or (any(word in query for word in product_words) and any(word in query for word in feature_words))
-        or (any(word in query for word in feature_words) and any(word in query for word in ("good", "better", "best")))
-    )
-
-
 def format_recommendation_reason(product: dict) -> str:
     """Explain a catalog DON'T BUY decision without exposing internal counts."""
     reasons = []
@@ -1529,6 +1300,56 @@ def find_catalog_product(text: str, catalog: list):
 
     return None
 
+
+def get_catalog_recommendations(text: str, catalog: list, limit: int = 3):
+    """Return the best matching catalog products for broad recommendation questions."""
+    query = (text or "").strip().lower()
+    category_terms = {
+        "phone": ("phone", "mobile", "smartphone", "iphone", "android"),
+        "laptop": ("laptop", "notebook", "computer", "macbook"),
+        "tablet": ("tablet", "ipad"),
+        "headphone": ("headphone", "earbuds", "earphone", " headset"),
+        "watch": ("watch", "smartwatch"),
+    }
+    requested_category = next(
+        (category for category, terms in category_terms.items() if any(term in query for term in terms)),
+        None,
+    )
+    avoid_only = any(phrase in query for phrase in ("avoid", "don't buy", "do not buy", "not worth", "worst"))
+    use_case_terms = set(query.replace("?", " ").replace(",", " ").split())
+
+    candidates = []
+    for item in catalog:
+        category = str(item.get("category", "")).lower()
+        product_text = " ".join(str(item.get(key, "")) for key in ("product_name", "brand", "category", "best_for")).lower()
+        if requested_category and requested_category not in category and requested_category not in product_text:
+            continue
+        if not avoid_only and str(item.get("buy_recommendation", "")).upper() != "BUY":
+            continue
+
+        score = float(item.get("recommendation_score") or 0)
+        score += sum(8 for term in use_case_terms if len(term) > 2 and term in product_text)
+        if str(item.get("buy_recommendation", "")).upper() == "BUY":
+            score += 5
+        candidates.append((score, item))
+
+    if not candidates and requested_category and not avoid_only:
+        candidates = [
+            (float(item.get("recommendation_score") or 0), item)
+            for item in catalog
+            if str(item.get("buy_recommendation", "")).upper() == "BUY"
+        ]
+
+    candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+    recommendations = []
+    for _, item in candidates:
+        product = get_catalog_product(str(item.get("product_name", "")), catalog)
+        if product and product["product"] not in {entry["product"] for entry in recommendations}:
+            recommendations.append(product)
+        if len(recommendations) == limit:
+            break
+    return recommendations
+
 @app.post("/chatbot")
 def chatbot_endpoint(request: ChatbotRequest):
     user_text = (request.text or "").strip()
@@ -1543,63 +1364,21 @@ def chatbot_endpoint(request: ChatbotRequest):
     try:
         reviews = load_review_dataset()
         catalog = load_product_catalog()
-        if is_sentiment_count_question(user_text):
-            counts = get_sentiment_counts()
-            reply_text = (
-                f"Databricks review sentiment totals: Positive: {counts['positive']}, "
-                f"Negative: {counts['negative']}, Neutral: {counts['neutral']}."
+        query_lower = user_text.lower()
+        product_request = any(
+            phrase in query_lower
+            for phrase in (
+                "buy", "purchase", "worth it", "recommend", "suggest", "best", "which phone",
+                "which mobile", "which laptop", "product", "phone", "mobile", "smartphone", "laptop",
+                "tablet", "headphone", "earbuds", "watch"
             )
-            return {
-                "status": "success",
-                "reply": reply_text,
-                "response": reply_text,
-                "sentiment_counts": counts,
-                "recommendations": []
-            }
-
-        if is_dont_recommend_question(user_text):
-            bad_products = get_catalog_dont_recommend(catalog)
-            reply_text = (
-                "These products are marked DON'T BUY based on the catalog's negative feedback and issue signals."
-                if bad_products else
-                "I could not find products marked DON'T BUY in the current catalog."
-            )
-            return {
-                "status": "success",
-                "reply": reply_text,
-                "response": reply_text,
-                "recommendations": bad_products,
-                "recommendation": bad_products[0] if bad_products else None
-            }
-
-        purchase_question = is_product_recommendation_question(user_text)
-
-        if purchase_question and not has_image and not find_catalog_product(user_text, catalog):
-            recommendations = get_catalog_recommendations(catalog, user_text)
-            if recommendations:
-                all_flagged = all(
-                    product.get("recommendation", "").upper() == "DON'T BUY"
-                    for product in recommendations
-                )
-                reply_text = (
-                    "The current data has no safe recommendation in that category. "
-                    "These are the matching products, and each is flagged DON'T BUY."
-                    if all_flagged else
-                    "Here are the best matching products within your requested category and budget."
-                )
-            else:
-                reply_text = "I could not find matching products in the catalog for that category and budget."
-            return {
-                "status": "success",
-                "reply": reply_text,
-                "response": reply_text,
-                "recommendations": recommendations,
-                "recommendation": recommendations[0] if recommendations else None
-            }
+        ) or has_image
+        purchase_question = product_request
+        catalog_recommendations = get_catalog_recommendations(user_text, catalog) if product_request else []
 
         # Catalog recommendations are deterministic and do not depend on Gemini.
         # This keeps buy/don't-buy queries useful even when the AI key is unavailable.
-        product_evidence = find_catalog_product(user_text, catalog) if purchase_question else None
+        product_evidence = find_catalog_product(user_text, catalog) if user_text else None
         if product_evidence:
             recommendation = product_evidence["recommendation"]
             reply_text = (
@@ -1624,13 +1403,7 @@ def chatbot_endpoint(request: ChatbotRequest):
 
         client = genai.Client(api_key=api_key)
 
-        prompt_text = user_text if user_text else "Analyze this product image and identify the product and any visible problem or defect."
-        if has_image:
-            prompt_text = (
-                f"{prompt_text}\n\n"
-                "Inspect the uploaded image carefully. State: detected product or object, visible problem/defect, "
-                "severity, and practical next step. If the image does not show a clear defect, say that explicitly."
-            )
+        prompt_text = user_text if user_text else "Analyze this image payload and provide review intelligence insights."
         if purchase_question:
             prompt_text = (
                 f"{prompt_text}\n\n"
@@ -1682,6 +1455,7 @@ def chatbot_endpoint(request: ChatbotRequest):
                     break
 
             if product_evidence:
+                catalog_recommendations = [product_evidence]
                 recommendation = product_evidence["recommendation"]
                 reply_text = (
                     f"Recommendation: {recommendation}\n"
@@ -1693,23 +1467,29 @@ def chatbot_endpoint(request: ChatbotRequest):
                 )
             else:
                 reply_text = (
-                    f"I could not confidently match the image to a product in the review dataset.\n"
-                    f"Gemini analysis: {reply_text}\n"
-                    "Recommendation: REVIEW CAREFULLY. Please provide the product name or model for a dataset-backed recommendation."
+                    f"Here are three catalog recommendations based on your query.\nGemini analysis: {reply_text}"
                 )
 
         return {
             "status": "success",
             "reply": reply_text,
             "response": reply_text,
-            "recommendation": product_evidence if purchase_question and 'product_evidence' in locals() else None,
-            "recommendations": ([product_evidence] if purchase_question and product_evidence else [])
+            "recommendation": product_evidence if purchase_question and 'product_evidence' in locals() else (catalog_recommendations[0] if catalog_recommendations else None),
+            "recommendations": catalog_recommendations
         }
 
     except Exception as e:
         reply_text = f"AI Assistant: Processed query '{user_text}'. (Gemini status: {str(e)})"
+        fallback_recommendations = []
+        if 'catalog' in locals() and product_request:
+            fallback_recommendations = get_catalog_recommendations(user_text, catalog)
         return {
             "status": "success",
-            "reply": reply_text,
-            "response": reply_text
+            "reply": (
+                f"Here are three catalog recommendations based on your query.\n{reply_text}"
+                if fallback_recommendations else reply_text
+            ),
+            "response": reply_text,
+            "recommendation": fallback_recommendations[0] if fallback_recommendations else None,
+            "recommendations": fallback_recommendations
         }
